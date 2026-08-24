@@ -1,0 +1,11 @@
+# 外部资产：游戏 mod（dds/buf/zip 及分析数据，1.5GB+）
+mods/
+
+# 构建产物
+wwmi-dx12/build/
+
+# 第三方源码副本（可从上游重新获取：3DMigoto / imgui / ReShade）
+wwmi-dx12/external/
+
+# 备份文件
+*.bak
