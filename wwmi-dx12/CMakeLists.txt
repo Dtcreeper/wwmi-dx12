@@ -26,6 +26,7 @@ add_library(wwmi-dx12 SHARED
     src/texture_tracker.cpp
     src/override_engine.cpp
     src/pipeline_tracker.cpp
+    src/skeleton_chain.cpp
     src/xxhash64.cpp
 )
 
@@ -65,6 +66,7 @@ add_executable(wwmi-tests
     tests/test_texture_tracker.cpp
     tests/test_override_engine.cpp
     tests/test_pipeline_tracker.cpp
+    tests/test_skeleton_chain.cpp
     src/ini_file.cpp
     src/mod_rules.cpp
     src/expr.cpp
@@ -78,6 +80,7 @@ add_executable(wwmi-tests
     src/texture_tracker.cpp
     src/override_engine.cpp
     src/pipeline_tracker.cpp
+    src/skeleton_chain.cpp
     src/xxhash64.cpp
 )
 
@@ -108,3 +111,8 @@ add_executable(runtime-probe tests/runtime_probe.cpp
     src/mod_rules.cpp)
 target_include_directories(runtime-probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_definitions(runtime-probe PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
+
+# M6 diagnostics: brute-force 3DMigoto hash hypotheses over a view dump
+add_executable(dump-probe tests/dump_probe.cpp src/crc32c.cpp)
+target_include_directories(dump-probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_definitions(dump-probe PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)

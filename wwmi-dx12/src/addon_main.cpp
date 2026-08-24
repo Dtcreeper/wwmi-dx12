@@ -51,6 +51,7 @@
 #include "dds_loader.hpp"
 #include "script_runtime.hpp"
 #include "pipeline_tracker.hpp"
+#include "skeleton_chain.hpp"
 
 // M4: direct OMSetBlendFactor for full float precision (ReShade's
 // dynamic_state path would round-trip through uint32 bit patterns).
@@ -60,8 +61,11 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
+#include <fstream>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -89,6 +93,16 @@ namespace wwmi
 		uint64_t resource = 0;
 		std::filesystem::path texture_path;
 		std::string section;
+	};
+
+	// M9: reference to a push-CBV root parameter (param index + binding
+	// inside the parameter). UINT32_MAX param = not found.
+	struct SkelParamRef
+	{
+		uint32_t param = UINT32_MAX;
+		uint32_t binding = 0;
+
+		bool found() const { return param != UINT32_MAX; }
 	};
 
 	struct RuntimeState
@@ -176,6 +190,72 @@ namespace wwmi
 		// in destroy_command_list.
 		std::unordered_map<uint64_t, IaState> draw_states;
 
+		// ---- M8: root signature tracking ----
+		// Graphics root state per command list, maintained from the
+		// push_descriptors / bind_descriptor_tables events, plus the
+		// parameter layout of every pipeline layout the game created.
+		// The skeleton system needs this to find the bone CBs the game's
+		// skinning VS reads (DX11's vs-cb3/vs-cb4) and to rebind them
+		// for the mod's re-issued draws.
+		struct RootCbvBinding
+		{
+			uint64_t buffer = 0; // resource handle
+			uint64_t offset = 0; // byte offset into the buffer
+			uint64_t size = UINT64_MAX; // range size from the push (UINT64_MAX = whole)
+		};
+		struct ClRootState
+		{
+			uint64_t layout = 0; // current graphics pipeline layout
+			std::unordered_map<uint64_t, RootCbvBinding> cbvs;   // (param<<32)|register
+			std::unordered_map<uint32_t, uint64_t> tables;       // param -> table base
+		};
+		std::unordered_map<uint64_t, ClRootState> cl_root;
+		std::unordered_map<uint64_t,
+			std::vector<reshade::api::pipeline_layout_param>> layouts;
+
+		// ---- M9: skeleton chain ----
+		// Config from mod.ini [SkeletonChain] (immutable after load_mods);
+		// skel_snap is the latest skeleton-CBV snapshot taken at a component
+		// draw (written under <lock>); the upload buffers and region layout
+		// are owned by the present thread, only the current slot's resource
+		// handle is published for the draw thread.
+		SkeletonChain skel;
+		struct SkelSnapshot
+		{
+			uint64_t layout = 0;
+			uint32_t cb3_param = UINT32_MAX; // root param bound at vs-cb3 (extra skeleton)
+			uint32_t cb3_binding = 0;        // binding index inside that param
+			uint32_t cb4_param = UINT32_MAX; // root param bound at vs-cb4 (main skeleton)
+			uint32_t cb4_binding = 0;        // binding index inside that param
+			uint64_t main_buf = 0, main_off = 0;
+			uint64_t extra_buf = 0, extra_off = 0;
+			uint64_t frame = 0;
+			bool valid = false;
+		};
+		SkelSnapshot skel_snap;
+		// layout handle -> (cb3 param/binding, cb4 param/binding); UINT32_MAX
+		// param means "identified as absent" (cached negative result).
+		std::unordered_map<uint64_t,
+			std::pair<SkelParamRef, SkelParamRef>> skel_layout_params;
+		bool skel_dumped = false; // one-time identification/content dump done
+
+		// Published upload state (present thread writes under <lock>).
+		uint64_t skel_gpu_buf = 0; // current ping-pong upload buffer handle
+		bool skel_gpu_ready = false;
+		// Region offsets inside the upload buffer (immutable once built).
+		struct SkelRegions
+		{
+			uint64_t merged_off = 0, extra_off = 0;
+			uint64_t remap_off[SkeletonChain::k_remap_tables] = {};
+			uint64_t extra_remap_off[SkeletonChain::k_remap_tables] = {};
+			uint64_t remap_bytes[SkeletonChain::k_remap_tables] = {};
+			uint64_t total = 0;
+		};
+		SkelRegions skel_regions;
+		// Counters for the detach stats line.
+		uint64_t skel_captures = 0;
+		uint64_t skel_pushes = 0;
+
 		// Set after load_mods() when any loaded rule uses handling =
 		// skip/abort. Bind/draw handlers early out on it: texture-only mod
 		// sets pay nothing per draw. Every access to index / buffers /
@@ -240,6 +320,20 @@ namespace wwmi
 		// load_mods() time for the overlay/log so a wrong WWMI_HOME or a
 		// missing %APPDATA% tree is immediately visible.
 		std::string mods_root;
+
+		// Mod manager catalog: every mod directory discovered under the
+		// Mods root at load_mods() time. 'enabled' is the persisted
+		// toggle (mods-disabled.txt, absent = enabled); 'loaded' is
+		// what actually happened this session. The overlay edits
+		// 'enabled' and rewrites the file immediately -- changes apply
+		// on the NEXT launch (no hot reload by design).
+		struct ModCatalogEntry
+		{
+			std::string name;
+			bool enabled = true;
+			bool loaded = false;
+		};
+		std::vector<ModCatalogEntry> mod_catalog;
 
 		// Aggregate counters (atomic: events fire on multiple threads).
 		std::atomic<uint64_t> devices = 0;
@@ -371,6 +465,171 @@ namespace wwmi
 		}
 	}
 
+	// ---------------------------------------------------------------------
+	// M9: [SkeletonChain] parsing
+	//
+	//   [SkeletonChain]
+	//   forward_table = Meshes/BlendRemapForward.buf
+	//   component = TextureOverrideComponent3, 118, 111, 0, 105
+	//               <rule section>, <vg_offset>, <vg_count>[, <remap_id>, <remap_count>]
+	// ---------------------------------------------------------------------
+
+	static void parse_skeleton_chain(const std::filesystem::path &ini,
+		const std::filesystem::path &mod_dir)
+	{
+		std::ifstream file(ini, std::ios::binary);
+		if (!file.is_open())
+			return;
+		const std::string text((std::istreambuf_iterator<char>(file)),
+			std::istreambuf_iterator<char>());
+
+		IniFile parsed;
+		if (!parse_ini(text, parsed))
+			return;
+
+		const IniSection *sec = nullptr;
+		for (const IniSection &s : parsed.sections)
+			if (iequals(s.name, "SkeletonChain"))
+			{
+				sec = &s;
+				break;
+			}
+		if (sec == nullptr)
+			return;
+
+		size_t registered = 0;
+		for (const IniEntry &e : sec->entries)
+		{
+			if (iequals(e.key, "forward_table"))
+			{
+				if (!g_state.skel.forward.empty())
+					continue; // first mod that supplies the table wins
+				const std::filesystem::path table = mod_dir / e.value;
+				std::ifstream tf(table, std::ios::binary);
+				if (!tf.is_open())
+				{
+					log::warn("skeleton chain: forward table '%s' not found",
+						table.string().c_str());
+					continue;
+				}
+				std::vector<uint8_t> raw((std::istreambuf_iterator<char>(tf)),
+					std::istreambuf_iterator<char>());
+				std::vector<uint16_t> forward(raw.size() / 2);
+				if (!forward.empty())
+					std::memcpy(forward.data(), raw.data(),
+						forward.size() * sizeof(uint16_t));
+				if (forward.empty() ||
+					forward.size() % SkeletonChain::k_remap_stride != 0)
+				{
+					log::warn("skeleton chain: forward table '%s' has %llu entries (not a multiple of %u): ignored",
+						table.string().c_str(),
+						static_cast<unsigned long long>(forward.size()),
+						SkeletonChain::k_remap_stride);
+					continue;
+				}
+				g_state.skel.forward = std::move(forward);
+				log::info("skeleton chain: forward table '%s' loaded (%llu entries)",
+					table.string().c_str(),
+					static_cast<unsigned long long>(g_state.skel.forward.size()));
+			}
+			else if (iequals(e.key, "component"))
+			{
+				// <rule section>, <vg_offset>, <vg_count>[, <remap_id>, <remap_count>]
+				std::vector<std::string> parts;
+				std::string item;
+				std::stringstream ss(e.value);
+				while (std::getline(ss, item, ','))
+				{
+					// trim
+					const auto first = item.find_first_not_of(" \t");
+					const auto last = item.find_last_not_of(" \t");
+					parts.push_back(first == std::string::npos
+						? std::string()
+						: item.substr(first, last - first + 1));
+				}
+				if (parts.size() < 3 || parts[0].empty())
+				{
+					log::warn("skeleton chain: malformed component '%s'",
+						e.value.c_str());
+					continue;
+				}
+
+				SkeletonChain::Component comp;
+				char *end = nullptr;
+				comp.vg_offset = std::strtoul(parts[1].c_str(), &end, 10);
+				comp.vg_count = std::strtoul(parts[2].c_str(), &end, 10);
+				if (parts.size() >= 5)
+				{
+					comp.remap_id = std::strtol(parts[3].c_str(), &end, 10);
+					comp.remap_count = std::strtoul(parts[4].c_str(), &end, 10);
+				}
+				if (comp.vg_count == 0 ||
+					comp.vg_offset + comp.vg_count > SkeletonChain::k_merged_bones ||
+					comp.remap_id >= static_cast<int32_t>(SkeletonChain::k_remap_tables))
+				{
+					log::warn("skeleton chain: component '%s' out of range: ignored",
+						e.value.c_str());
+					continue;
+				}
+
+				g_state.skel.rules[parts[0]] = comp;
+				++registered;
+			}
+		}
+
+		if (registered > 0)
+			log::info("skeleton chain: %llu component(s) registered from '%S'",
+				static_cast<unsigned long long>(registered), mod_dir.c_str());
+	}
+
+	// ---------------------------------------------------------------------
+	// Mod manager persistence: one mod folder name per line in
+	// <data_root>/mods-disabled.txt. Absent = enabled (new mods load by
+	// default); listed = skipped at load_mods() time on the next launch.
+	// ---------------------------------------------------------------------
+
+	static std::filesystem::path disabled_mods_path()
+	{
+		return data_root() / "mods-disabled.txt";
+	}
+
+	static std::vector<std::string> read_disabled_mods()
+	{
+		std::vector<std::string> names;
+		std::ifstream f(disabled_mods_path());
+		if (!f)
+			return names;
+
+		std::string line;
+		while (std::getline(f, line))
+		{
+			while (!line.empty() &&
+				(line.back() == '\r' || line.back() == ' ' ||
+					line.back() == '\t'))
+				line.pop_back();
+			if (!line.empty())
+				names.push_back(line);
+		}
+		return names;
+	}
+
+	// Rewrites the whole file from the catalog (called under g_state.lock
+	// on an overlay toggle; a tiny truncating write is fine there).
+	static void write_disabled_mods(
+		const std::vector<RuntimeState::ModCatalogEntry> &catalog)
+	{
+		std::ofstream f(disabled_mods_path(), std::ios::trunc);
+		if (!f)
+		{
+			log::warn("mod manager: cannot write %S",
+				disabled_mods_path().c_str());
+			return;
+		}
+		for (const RuntimeState::ModCatalogEntry &e : catalog)
+			if (!e.enabled)
+				f << e.name << '\n';
+	}
+
 	static void load_mods()
 	{
 		std::vector<TextureOverrideRule> rules;
@@ -386,6 +645,7 @@ namespace wwmi
 		}
 		g_state.mods_root = mods_dir.string();
 		const std::filesystem::path persist_dir = data_root() / "Persist";
+		const std::vector<std::string> disabled = read_disabled_mods();
 
 		size_t mods = 0;
 		for (const auto &entry : std::filesystem::directory_iterator(mods_dir, ec))
@@ -393,11 +653,38 @@ namespace wwmi
 			if (!entry.is_directory())
 				continue;
 
+			// Only directories holding a mod.ini are mods; everything
+			// else (READMEs, backups) stays invisible to the manager.
 			const std::filesystem::path ini = entry.path() / "mod.ini";
-			ModRules mod;
-			if (!load_mod_rules(ini, mod))
+			std::error_code ini_ec;
+			if (!std::filesystem::is_regular_file(ini, ini_ec))
 				continue;
 
+			const std::string name = entry.path().filename().string();
+
+			RuntimeState::ModCatalogEntry cat;
+			cat.name = name;
+			cat.enabled = std::find(disabled.begin(), disabled.end(),
+				name) == disabled.end();
+
+			if (!cat.enabled)
+			{
+				log::info("mod '%s' disabled by manager: skipped", name.c_str());
+				g_state.mod_catalog.push_back(std::move(cat));
+				continue;
+			}
+
+			ModRules mod;
+			if (!load_mod_rules(ini, mod))
+			{
+				log::warn("mod '%s': mod.ini failed to load: skipped",
+					name.c_str());
+				g_state.mod_catalog.push_back(std::move(cat));
+				continue;
+			}
+
+			cat.loaded = true;
+			g_state.mod_catalog.push_back(std::move(cat));
 			++mods;
 			for (const auto &warning : mod.warnings)
 				log::warn("%S: %s", entry.path().c_str(), warning.c_str());
@@ -432,6 +719,12 @@ namespace wwmi
 			}
 
 			resolve_rule_textures(mod);
+
+			// M9: [SkeletonChain] -- per-component skeleton merge windows
+			// and the Forward remap table (see skeleton_chain.hpp). Parsed
+			// from the raw ini (the rule parser has no section for it).
+			parse_skeleton_chain(ini, entry.path());
+
 			rules.insert(rules.end(), mod.overrides.begin(), mod.overrides.end());
 			shader_rules.insert(shader_rules.end(),
 				std::make_move_iterator(mod.shader_overrides.begin()),
@@ -439,6 +732,17 @@ namespace wwmi
 		}
 
 		g_state.has_scripts = !g_state.runtimes.empty();
+
+		// M6 fix: build the pooled-IB window index from the same rule
+		// set BEFORE index.build moves it away. Without this call
+		// find_by_draw() never matches, region probes never start and
+		// pooled-IB model replacement is silently dead (the windows
+		// log below is the only visible signal).
+		size_t windowed_rules = 0;
+		for (const TextureOverrideRule &rule : rules)
+			if (rule.has_hash && rule.match_first_index.enabled && rule.match_index_count.enabled)
+				++windowed_rules;
+		g_state.windows.build(rules);
 		g_state.index.build(std::move(rules));
 
 		// M4: ShaderOverride hash index (immutable after this point).
@@ -457,9 +761,22 @@ namespace wwmi
 			static_cast<unsigned long long>(g_state.runtimes.size()),
 			static_cast<unsigned long long>(g_state.shader_overrides.size()));
 
+		// M9: skeleton chain summary (config is immutable from here on).
+		if (g_state.skel.active())
+		{
+			g_state.skel.finalize_config();
+			log::info("skeleton chain active: %llu component rule(s)%s",
+				static_cast<unsigned long long>(g_state.skel.rules.size()),
+				g_state.skel.has_remap() ? ", forward remap table loaded" : "");
+		}
+
 		if (!g_state.windows.empty())
 			log::info("pooled-IB window matching enabled: %llu rule group(s) (region hashing for pooled index buffers)",
 				static_cast<unsigned long long>(g_state.windows.groups().size()));
+		else if (windowed_rules > 0)
+			log::warn("%llu windowed rule(s) (match_first_index + match_index_count) produced no probe group: "
+				"rules without handling = skip cannot join region hashing and will only match learned whole buffers",
+				static_cast<unsigned long long>(windowed_rules));
 
 		const std::filesystem::path cache_path = data_root() / "session-cache.json";
 		if (g_state.session.load(cache_path))
@@ -760,6 +1077,359 @@ namespace wwmi
 		device->destroy_resource(intermediate);
 	}
 
+	// ---------------------------------------------------------------------
+	// M9: skeleton chain -- present-time capture / merge / upload
+	// ---------------------------------------------------------------------
+
+	// Reads 'rows' float4s out of a game constant-buffer ring region.
+	// Fast path: persistently-mapped upload rings map directly (the game
+	// CPU wrote the frame's constants before recording, so no GPU sync is
+	// needed). Slow path: default-heap buffers go through a staging copy
+	// and a queue wait. Returns false when the handle is stale or the
+	// region runs past the buffer end (caller retries with the next
+	// frame's snapshot).
+	static bool read_game_cb(reshade::api::device *device,
+		reshade::api::command_queue *queue, uint64_t buffer, uint64_t offset,
+		float *out, uint32_t rows, bool dump, const char *tag)
+	{
+		const uint64_t bytes = static_cast<uint64_t>(rows) * 4 * sizeof(float);
+		if (buffer == 0)
+			return false;
+
+		const reshade::api::resource_desc desc =
+			device->get_resource_desc(reshade::api::resource{ buffer });
+		if (desc.type != reshade::api::resource_type::buffer ||
+			desc.buffer.size < offset + bytes)
+		{
+			if (dump)
+				log::warn("skeleton cb %s: buffer %llx +%llu out of range (%llu bytes)",
+					tag, static_cast<unsigned long long>(buffer),
+					static_cast<unsigned long long>(offset),
+					static_cast<unsigned long long>(desc.buffer.size));
+			return false;
+		}
+
+		void *ptr = nullptr;
+		if (device->map_buffer_region(reshade::api::resource{ buffer }, offset,
+			bytes, reshade::api::map_access::read_only, &ptr))
+		{
+			std::memcpy(out, ptr, static_cast<size_t>(bytes));
+			device->unmap_buffer_region(reshade::api::resource{ buffer });
+			if (dump)
+				log::info("skeleton cb %s: buffer %llx +%llu (%llu bytes) direct-mapped",
+					tag, static_cast<unsigned long long>(buffer),
+					static_cast<unsigned long long>(offset),
+					static_cast<unsigned long long>(desc.buffer.size));
+			return true;
+		}
+
+		const reshade::api::resource_desc rb_desc(bytes,
+			reshade::api::memory_heap::readback,
+			reshade::api::resource_usage::copy_dest);
+		reshade::api::resource intermediate{};
+		if (!device->create_resource(rb_desc, nullptr,
+			reshade::api::resource_usage::copy_dest, &intermediate))
+			return false;
+
+		reshade::api::command_list *const cmd = queue->get_immediate_command_list();
+		cmd->copy_buffer_region(reshade::api::resource{ buffer }, offset,
+			intermediate, 0, bytes);
+		submit_and_wait(queue);
+
+		bool ok = false;
+		void *data = nullptr;
+		if (device->map_buffer_region(intermediate, 0, UINT64_MAX,
+			reshade::api::map_access::read_only, &data))
+		{
+			std::memcpy(out, data, static_cast<size_t>(bytes));
+			device->unmap_buffer_region(intermediate);
+			ok = true;
+		}
+		device->destroy_resource(intermediate);
+
+		if (dump)
+		{
+			if (ok)
+				log::info("skeleton cb %s: buffer %llx +%llu (%llu bytes) staged copy",
+					tag, static_cast<unsigned long long>(buffer),
+					static_cast<unsigned long long>(offset),
+					static_cast<unsigned long long>(desc.buffer.size));
+			else
+				log::warn("skeleton cb %s: staged copy map failed", tag);
+		}
+		return ok;
+	}
+
+	// One-time content validation of the captured skeleton CBs: non-zero
+	// float4-row density (a character skeleton has hundreds of live bones)
+	// and a scan for the 3381.7xx marker family the WWMI stack uses to
+	// identify skeleton constant buffers.
+	static void dump_skeleton_content(const char *tag, const float *cb)
+	{
+		uint32_t non_zero_rows = 0;
+		int marker = -1;
+		for (uint32_t row = 0; row < SkeletonChain::k_game_rows; ++row)
+		{
+			for (uint32_t e = 0; e < 4; ++e)
+			{
+				const float v = cb[row * 4 + e];
+				if (v == 0.0f)
+					continue;
+				if (e == 0)
+					++non_zero_rows;
+				if (marker < 0 && v >= 3381.0f && v <= 3382.0f)
+					marker = static_cast<int>(row);
+			}
+		}
+		log::info("skeleton cb %s: %u/%u live float4 rows%s head=[%.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f]",
+			tag, non_zero_rows, SkeletonChain::k_game_rows,
+			marker >= 0 ? ", 3381.x marker present" : "",
+			cb[0], cb[1], cb[2], cb[3], cb[4], cb[5], cb[6], cb[7]);
+	}
+
+	// Uploads this frame's merged skeletons into the ping-pong upload
+	// buffer and publishes the current slot for the draw thread. Root
+	// CBV bindings require 256-byte aligned offsets, so every region is
+	// padded to a 256-byte multiple.
+	static void upload_skeleton(reshade::api::device *device)
+	{
+		// 8-deep ring: the CPU may run MaxFrameLatency (up to 3) frames
+		// ahead of the GPU, and this map-write uploads directly into GPU
+		// memory -- reusing a slot the GPU is still reading corrupts the
+		// bones of in-flight frames. 8 covers any realistic latency.
+		static constexpr uint32_t k_slots = 8;
+		static reshade::api::resource slots[k_slots] = {};
+		static uint32_t slot = 0;
+		static bool s_ready_logged = false;
+
+		// Region layout is immutable once built (config is load-time
+		// constant); built lazily on the first upload.
+		bool need_regions = false;
+		{
+			std::lock_guard<std::mutex> guard(g_state.lock);
+			need_regions = g_state.skel_regions.total == 0;
+		}
+		if (need_regions)
+		{
+			RuntimeState::SkelRegions r{};
+			uint64_t off = 0;
+			const auto place = [&off](uint64_t bytes, uint64_t *out_off) {
+				*out_off = off;
+				off += (bytes + 255) / 256 * 256;
+			};
+			const uint64_t merged_bytes =
+				SkeletonChain::bone_rows_bytes(SkeletonChain::k_merged_bones);
+			// Remapped regions are full game-CB sized (768 float4 rows):
+			// the VS declares Skeleton[768] and root CBVs carry no size,
+			// so the whole declared range must be valid, zero-padded
+			// past the live bones (matches the DX11 resources, which
+			// were full-size copies).
+			const uint64_t cb_bytes =
+				SkeletonChain::bone_rows_bytes(SkeletonChain::k_game_rows / 3);
+			place(merged_bytes, &r.merged_off);
+			place(merged_bytes, &r.extra_off);
+			for (uint32_t i = 0; i < SkeletonChain::k_remap_tables; ++i)
+			{
+				r.remap_bytes[i] = g_state.skel.remap_bones(i) != 0 ? cb_bytes : 0;
+				place(r.remap_bytes[i], &r.remap_off[i]);
+				place(r.remap_bytes[i], &r.extra_remap_off[i]);
+			}
+			r.total = off;
+			std::lock_guard<std::mutex> guard(g_state.lock);
+			g_state.skel_regions = r;
+		}
+
+		RuntimeState::SkelRegions r{};
+		{
+			std::lock_guard<std::mutex> guard(g_state.lock);
+			r = g_state.skel_regions;
+		}
+		if (r.total == 0)
+			return;
+
+		// Lazy creation of the ping-pong upload buffers.
+		{
+			OwnCreationGuard guard;
+			for (uint32_t i = 0; i < k_slots; ++i)
+			{
+				if (slots[i].handle != 0)
+					continue;
+				const reshade::api::resource_desc desc(r.total,
+					reshade::api::memory_heap::cpu_to_gpu,
+					reshade::api::resource_usage::general);
+				if (!device->create_resource(desc, nullptr,
+					reshade::api::resource_usage::general, &slots[i]))
+				{
+					log::warn("skeleton upload buffer creation failed (%llu bytes)",
+						static_cast<unsigned long long>(r.total));
+					return;
+				}
+			}
+		}
+
+		slot = (slot + 1) % k_slots;
+		const reshade::api::resource dst = slots[slot];
+
+		void *ptr = nullptr;
+		if (!device->map_buffer_region(dst, 0, UINT64_MAX,
+			reshade::api::map_access::write_only, &ptr))
+		{
+			log::warn("skeleton upload map failed (slot %u)", slot);
+			return;
+		}
+
+		const uint64_t merged_bytes =
+			SkeletonChain::bone_rows_bytes(SkeletonChain::k_merged_bones);
+		auto *dst_bytes = static_cast<uint8_t *>(ptr);
+		std::memcpy(dst_bytes + r.merged_off, g_state.skel.merged(), merged_bytes);
+		std::memcpy(dst_bytes + r.extra_off, g_state.skel.extra(), merged_bytes);
+		for (uint32_t i = 0; i < SkeletonChain::k_remap_tables; ++i)
+		{
+			if (r.remap_bytes[i] == 0)
+				continue;
+			std::memcpy(dst_bytes + r.remap_off[i],
+				g_state.skel.remapped(i), r.remap_bytes[i]);
+			std::memcpy(dst_bytes + r.extra_remap_off[i],
+				g_state.skel.extra_remapped(i), r.remap_bytes[i]);
+		}
+		device->unmap_buffer_region(dst);
+
+		{
+			std::lock_guard<std::mutex> guard(g_state.lock);
+			g_state.skel_gpu_buf = dst.handle;
+			g_state.skel_gpu_ready = true;
+		}
+
+		if (!s_ready_logged)
+		{
+			s_ready_logged = true;
+			log::info("skeleton upload ready: %u x %llu byte ping-pong buffers, %u main / %u extra bone(s) merged",
+				k_slots,
+				static_cast<unsigned long long>(r.total),
+				g_state.skel.merged_bones_written(),
+				g_state.skel.extra_bones_written());
+		}
+	}
+
+	// Present-time skeleton processing: capture the game's two skeleton
+	// CBs (snapshot taken at the last component draw), merge them into
+	// the mod's skeleton layout and upload the result -- the NEXT frame's
+	// mod draws bind it (1-frame delay, like the WWMI Merged skeleton
+	// mode).
+	static void process_skeleton(reshade::api::command_queue *queue)
+	{
+		reshade::api::device *const device = queue->get_device();
+
+		RuntimeState::SkelSnapshot snap;
+		bool dump = false;
+		{
+			std::lock_guard<std::mutex> guard(g_state.lock);
+			if (!g_state.skel.active() || !g_state.skel_snap.valid)
+				return;
+			snap = g_state.skel_snap;
+			dump = !g_state.skel_dumped;
+		}
+
+		// M9 diagnostics: log each DISTINCT capture source (layout,
+		// buffer, offset pairs). Different render passes bind different
+		// root params / ring offsets; the LAST component draw of the
+		// frame wins the capture, so this log answers "whose skeleton
+		// did we actually capture" when components misbehave.
+		static uint32_t s_src_logs = 0;
+		static uint64_t s_prev_main_buf = 0, s_prev_main_off = 0;
+		static uint64_t s_prev_extra_buf = 0, s_prev_extra_off = 0;
+		static uint64_t s_prev_layout = 0;
+		if (s_src_logs < 30 &&
+			(snap.main_buf != s_prev_main_buf || snap.main_off != s_prev_main_off ||
+				snap.extra_buf != s_prev_extra_buf || snap.extra_off != s_prev_extra_off ||
+				snap.layout != s_prev_layout))
+		{
+			++s_src_logs;
+			log::info("skeleton capture #%u: layout %llx cb4/main=%llx+%llu cb3/extra=%llx+%llu",
+				s_src_logs,
+				static_cast<unsigned long long>(snap.layout),
+				static_cast<unsigned long long>(snap.main_buf),
+				static_cast<unsigned long long>(snap.main_off),
+				static_cast<unsigned long long>(snap.extra_buf),
+				static_cast<unsigned long long>(snap.extra_off));
+			s_prev_main_buf = snap.main_buf;
+			s_prev_main_off = snap.main_off;
+			s_prev_extra_buf = snap.extra_buf;
+			s_prev_extra_off = snap.extra_off;
+			s_prev_layout = snap.layout;
+		}
+
+		std::vector<float> main_cb(static_cast<size_t>(SkeletonChain::k_game_rows) * 4);
+		std::vector<float> extra_cb(static_cast<size_t>(SkeletonChain::k_game_rows) * 4);
+		if (!read_game_cb(device, queue, snap.main_buf, snap.main_off,
+				main_cb.data(), SkeletonChain::k_game_rows, dump, "cb4/main") ||
+			!read_game_cb(device, queue, snap.extra_buf, snap.extra_off,
+				extra_cb.data(), SkeletonChain::k_game_rows, dump, "cb3/extra"))
+			return; // stale handles: the next snapshot retries
+
+		if (dump)
+		{
+			g_state.skel_dumped = true;
+			dump_skeleton_content("cb4/main", main_cb.data());
+			dump_skeleton_content("cb3/extra", extra_cb.data());
+		}
+
+		g_state.skel.merge(main_cb.data(), extra_cb.data());
+		++g_state.skel_captures;
+
+		upload_skeleton(device);
+	}
+
+	// M6 diagnostics: on a view's FIRST mismatch, persist the probed
+	// region (plus slack up to the pool tail) so the exact 3DMigoto
+	// hash hypothesis -- original ByteWidth and D3D11 desc fields such
+	// as Usage=IMMUTABLE vs DEFAULT -- can be verified OFFLINE with
+	// the dump-probe tool instead of guessing from mismatch lines.
+	static constexpr uint64_t k_view_dump_slack = 4ull * 1024 * 1024;
+	static std::atomic<uint32_t> g_view_dumps{ 0 };
+
+	static void dump_probe_region(const void *data, uint64_t len,
+		const RuntimeState::IndexProbe &p)
+	{
+		const uint32_t slot = g_view_dumps.fetch_add(1);
+		if (slot >= 16)
+			return; // budget: the first 16 mismatching views only
+
+		std::error_code ec;
+		const std::filesystem::path dir = data_root() / "Dumps";
+		std::filesystem::create_directories(dir, ec);
+
+		char name[96];
+		sprintf_s(name, "iv_%016llx_off%llu_is%u.bin",
+			static_cast<unsigned long long>(p.handle),
+			static_cast<unsigned long long>(p.offset), p.index_size);
+		const std::filesystem::path path = dir / name;
+
+		std::ofstream f(path, std::ios::binary);
+		if (!f)
+		{
+			log::warn("view dump failed: cannot open %S", path.c_str());
+			return;
+		}
+		f.write(static_cast<const char *>(data),
+			static_cast<std::streamsize>(len));
+
+		// Eyeball line: sane index data is smallish u32 values; huge
+		// or random-looking words point at a wrong region base.
+		const uint32_t *u = static_cast<const uint32_t *>(data);
+		const size_t n = std::min<size_t>(static_cast<size_t>(len) / 4, 4096);
+		uint32_t mx = 0;
+		for (size_t i = 0; i < n; ++i)
+			mx = std::max(mx, u[i]);
+		log::info("view dump #%u: %S (%llu bytes; span=%u want=%08x) first=%08x %08x %08x %08x max[first %llu u32]=%u",
+			slot + 1, path.c_str(),
+			static_cast<unsigned long long>(len), p.span_bytes,
+			p.group_hash,
+			n > 0 ? u[0] : 0, n > 1 ? u[1] : 0,
+			n > 2 ? u[2] : 0, n > 3 ? u[3] : 0,
+			static_cast<unsigned long long>(n), mx);
+	}
+
 	// M6: region readback + hash compare for one pooled-IB probe. The
 	// region [view_offset + min_first_index*is, span) inside the pool is
 	// exactly the bytes the DX11-era dedicated index buffer contained, so
@@ -796,23 +1466,31 @@ namespace wwmi
 			return;
 		}
 
+		// Read span + slack (clamped to the pool tail): the slack feeds
+		// the mismatch dump so offline tools can also test
+		// ByteWidth-larger-than-span hash hypotheses.
+		const uint64_t region_avail = src_size - region_offset;
+		const uint64_t read_len = std::min<uint64_t>(region_avail,
+			uint64_t(p.span_bytes) + k_view_dump_slack);
+
 		const reshade::api::resource_desc rb_desc(
-			p.span_bytes, reshade::api::memory_heap::readback,
+			read_len, reshade::api::memory_heap::readback,
 			reshade::api::resource_usage::copy_dest);
 
 		reshade::api::resource intermediate{};
 		if (!device->create_resource(rb_desc, nullptr,
 			reshade::api::resource_usage::copy_dest, &intermediate))
 		{
-			log::warn("view-probe buffer creation failed for %p (%u bytes)",
-				reinterpret_cast<void *>(p.handle), p.span_bytes);
+			log::warn("view-probe buffer creation failed for %p (%llu bytes)",
+				reinterpret_cast<void *>(p.handle),
+				static_cast<unsigned long long>(read_len));
 			std::lock_guard<std::mutex> guard(g_state.lock);
 			g_state.index_views.set_failed(p.handle, p.offset);
 			return;
 		}
 
 		reshade::api::command_list *const cmd = queue->get_immediate_command_list();
-		cmd->copy_buffer_region(src, region_offset, intermediate, 0, p.span_bytes);
+		cmd->copy_buffer_region(src, region_offset, intermediate, 0, read_len);
 		submit_and_wait(queue);
 
 		uint32_t full_hash = 0;
@@ -824,6 +1502,8 @@ namespace wwmi
 			const uint32_t data_hash = calc_buffer_data_hash(data, p.span_bytes);
 			full_hash = calc_buffer_hash(data_hash, p.span_bytes, BufferRole::index);
 			mapped = true;
+			if (full_hash != p.group_hash && p.retries == 0)
+				dump_probe_region(data, read_len, p);
 			device->unmap_buffer_region(intermediate);
 		}
 		device->destroy_resource(intermediate);
@@ -1008,6 +1688,10 @@ namespace wwmi
 		{
 			if (_cmd == nullptr)
 				return;
+			// M9: the skeleton CBV replacement applies lazily at the first
+			// re-issued draw -- a body that never skips (mod disabled)
+			// leaves the game's bindings untouched.
+			apply_skeleton_pushes();
 			_cmd->draw_indexed(index_count, instance_count, first_index, base_vertex, 0);
 			++g_state.script_draws_issued;
 		}
@@ -1020,6 +1704,83 @@ namespace wwmi
 			_cmd->copy_buffer_region(reshade::api::resource{ src }, src_offset,
 				reshade::api::resource{ dst }, dst_offset, size);
 		}
+
+		// ---- M9: skeleton CBV replacement ----
+		// Armed by evaluate_draw before the rule body runs; the pushes are
+		// applied lazily at the first re-issued draw (skip-gated) and the
+		// game's original bindings are pushed back afterwards. All pushes
+		// happen inside the ScriptExecGuard window, so they do not pollute
+		// the root-state tracking.
+		void arm_skeleton(uint64_t layout, const SkelParamRef &cb3,
+			const RuntimeState::RootCbvBinding &orig_cb3, const SkelParamRef &cb4,
+			const RuntimeState::RootCbvBinding &orig_cb4, uint64_t gpu_buffer,
+			uint64_t main_off, uint64_t main_size,
+			uint64_t extra_off, uint64_t extra_size)
+		{
+			_skel_armed = true;
+			_skel_applied = false;
+			_skel_layout = layout;
+			_skel_cb3 = cb3;
+			_skel_cb4 = cb4;
+			_skel_orig_cb3 = orig_cb3;
+			_skel_orig_cb4 = orig_cb4;
+			_skel_gpu_buffer = gpu_buffer;
+			_skel_main_off = main_off;
+			_skel_main_size = main_size;
+			_skel_extra_off = extra_off;
+			_skel_extra_size = extra_size;
+		}
+
+		bool skeleton_applied() const { return _skel_applied; }
+
+		void restore_skeleton()
+		{
+			if (!_skel_applied || _cmd == nullptr)
+			{
+				_skel_armed = false;
+				return;
+			}
+			push_cbv(_cmd, _skel_layout, _skel_cb4,
+				_skel_orig_cb4.buffer, _skel_orig_cb4.offset, _skel_orig_cb4.size);
+			push_cbv(_cmd, _skel_layout, _skel_cb3,
+				_skel_orig_cb3.buffer, _skel_orig_cb3.offset, _skel_orig_cb3.size);
+			_skel_applied = false;
+			_skel_armed = false;
+		}
+
+	private:
+		void apply_skeleton_pushes()
+		{
+			if (!_skel_armed || _skel_applied || _cmd == nullptr)
+				return;
+			_skel_applied = true;
+			// cb4 (main skeleton) <- merged, cb3 (extra) <- extra merged.
+			push_cbv(_cmd, _skel_layout, _skel_cb4,
+				_skel_gpu_buffer, _skel_main_off, _skel_main_size);
+			push_cbv(_cmd, _skel_layout, _skel_cb3,
+				_skel_gpu_buffer, _skel_extra_off, _skel_extra_size);
+			++g_state.skel_pushes;
+		}
+
+		static void push_cbv(reshade::api::command_list *cmd, uint64_t layout,
+			const SkelParamRef &slot, uint64_t buffer, uint64_t offset, uint64_t size)
+		{
+			if (buffer == 0 || !slot.found())
+				return;
+			reshade::api::buffer_range range{};
+			range.buffer = reshade::api::resource{ buffer };
+			range.offset = offset;
+			range.size = size;
+			reshade::api::descriptor_table_update update{};
+			update.type = reshade::api::descriptor_type::constant_buffer;
+			update.binding = slot.binding;
+			update.count = 1;
+			update.descriptors = &range;
+			cmd->push_descriptors(reshade::api::shader_stage::all,
+				reshade::api::pipeline_layout{ layout }, slot.param, update);
+		}
+
+	public:
 
 		// M4: applies the script's merged BlendConfig for the draw that
 		// follows. Returns a revoke token (the bound source pipeline) or
@@ -1131,6 +1892,18 @@ namespace wwmi
 	private:
 		reshade::api::device *_device;
 		reshade::api::command_list *_cmd;
+
+		// M9 skeleton replacement state (see arm_skeleton).
+		bool _skel_armed = false;
+		bool _skel_applied = false;
+		uint64_t _skel_layout = 0;
+		SkelParamRef _skel_cb3{};
+		SkelParamRef _skel_cb4{};
+		RuntimeState::RootCbvBinding _skel_orig_cb3{};
+		RuntimeState::RootCbvBinding _skel_orig_cb4{};
+		uint64_t _skel_gpu_buffer = 0;
+		uint64_t _skel_main_off = 0, _skel_main_size = 0;
+		uint64_t _skel_extra_off = 0, _skel_extra_size = 0;
 	};
 
 	// Re-applies the pre-script IA bindings to the recording. The game's
@@ -1156,10 +1929,22 @@ namespace wwmi
 	// when the draw signature matches a mod window group. Caller must
 	// hold g_state.lock. Cheap on the hot path: one linear scan over
 	// the window groups (mesh mods use a handful) and a hash lookup.
+	//
+	// Diagnostics: a window hit also marks the view 'interesting' so
+	// the draw-indexed hook tallies EVERY subsequent signature on it --
+	// the real section layout, which decides whether byte-hash probes
+	// are even the right verification (UE DX12 re-indexes meshes).
 	static void schedule_index_view_probe(const IaState &ia, const DrawCallInfo &call)
 	{
 		if (ia.ib_buffer == 0 || ia.ib_index_size == 0)
 			return;
+
+		// Diagnostics: tally EVERY indexed draw signature on an
+		// already-interesting view (window hits and misses alike) --
+		// the view's real section layout.
+		if (TrackedIndexView *tv = g_state.index_views.find(ia.ib_buffer, ia.ib_offset))
+			if (tv->interesting)
+				tv->tally(call.first_index, call.index_count);
 
 		const DrawRuleGroup *grp =
 			g_state.windows.find_by_draw(call.first_index, call.index_count);
@@ -1168,7 +1953,34 @@ namespace wwmi
 
 		TrackedIndexView *v = g_state.index_views.track(
 			ia.ib_buffer, ia.ib_offset, ia.ib_index_size, g_state.frame);
-		if (v == nullptr || !g_state.index_views.probe_due(*v, g_state.frame))
+		if (v == nullptr)
+			return;
+		if (!v->interesting)
+		{
+			// First window hit on this view: start the tally.
+			v->interesting = true;
+			v->tally(call.first_index, call.index_count);
+		}
+
+		// M7: signature-coverage verification -- once every window of
+		// the group has been drawn on this view, the layout proves the
+		// view IS the mod's mesh pool region (collision-proof for
+		// multi-window tilings). This bypasses the byte-hash probe,
+		// which can never succeed on UE DX12 (vertex re-indexing).
+		if (v->state != TrackedIndexView::State::verified &&
+			signature_coverage_complete(*v, *grp))
+		{
+			g_state.index_views.set_verified(
+				ia.ib_buffer, ia.ib_offset, grp->hash);
+			log::info("index view verified by signature coverage: buffer %p off=%llu is=%u -> hash %08x (%u window(s) drawn; byte-hash probe bypassed)",
+				reinterpret_cast<void *>(ia.ib_buffer),
+				static_cast<unsigned long long>(ia.ib_offset),
+				ia.ib_index_size, grp->hash,
+				static_cast<unsigned>(grp->windows.size()));
+			return;
+		}
+
+		if (!g_state.index_views.probe_due(*v, g_state.frame))
 			return;
 
 		const uint64_t span_bytes =
@@ -1208,6 +2020,223 @@ namespace wwmi
 		probe.section = grp->section;
 		g_state.view_probes.push_back(std::move(probe));
 		++g_state.view_probes_issued;
+	}
+
+	// M8 diagnostics: short readable name for the vertex formats the
+	// game's input layouts actually use (unknown values fall back to
+	// the numeric enum so nothing is silently hidden).
+	static const char *vertex_format_name(reshade::api::format f)
+	{
+		using reshade::api::format;
+		switch (f)
+		{
+		case format::r32g32b32a32_float: return "r32g32b32a32f";
+		case format::r32g32b32_float: return "r32g32b32f";
+		case format::r32g32_float: return "r32g32f";
+		case format::r32g32_uint: return "r32g32u";
+		case format::r32_uint: return "r32u";
+		case format::r16g16b16a16_float: return "r16g16b16a16f";
+		case format::r16g16b16a16_snorm: return "r16g16b16a16sn";
+		case format::r16g16_float: return "r16g16f";
+		case format::r16g16_uint: return "r16g16u";
+		case format::r16g16_snorm: return "r16g16sn";
+		case format::r16_uint: return "r16u";
+		case format::r11g11b10_float: return "r11g11b10f";
+		case format::r10g10b10a2_unorm: return "r10g10b10a2un";
+		case format::r8g8b8a8_unorm: return "r8g8b8a8un";
+		case format::r8g8b8a8_uint: return "r8g8b8a8u";
+		case format::r8g8b8a8_snorm: return "r8g8b8a8sn";
+		case format::r8_uint: return "r8u";
+		default: return nullptr;
+		}
+	}
+
+	// ---------------------------------------------------------------------
+	// M9: skeleton chain -- draw-time snapshot + bridge arming
+	// ---------------------------------------------------------------------
+
+	// Finds the root parameter of a pipeline layout that carries the
+	// vertex-stage constant buffer bound at 'register_index' in register
+	// space 0 -- the DX12 mapping of the DX11 mod's vs-cb3/vs-cb4
+	// replacement. Push parameters with multiple ranges are scanned in
+	// full (the register can live beyond ranges[0]); the matching range's
+	// binding index is reported for the push_descriptors update.
+	// UINT32_MAX param = layout has no such push param (the skeleton may
+	// then live in descriptor tables, which this implementation does not
+	// intercept).
+	static SkelParamRef find_push_cbv_param(
+		const std::vector<reshade::api::pipeline_layout_param> &params,
+		uint32_t register_index)
+	{
+		SkelParamRef out{};
+		for (uint32_t i = 0; i < params.size(); ++i)
+		{
+			const reshade::api::pipeline_layout_param &p = params[i];
+			const reshade::api::descriptor_range *ranges = nullptr;
+			uint32_t count = 1;
+			switch (p.type)
+			{
+			case reshade::api::pipeline_layout_param_type::push_descriptors:
+				ranges = &p.push_descriptors;
+				count = 1;
+				break;
+			case reshade::api::pipeline_layout_param_type::push_descriptors_with_ranges:
+			case reshade::api::pipeline_layout_param_type::push_descriptors_with_ranges_and_flags:
+				ranges = p.descriptor_table_with_flags.count != 0
+					? p.descriptor_table_with_flags.ranges
+					: nullptr;
+				count = p.descriptor_table_with_flags.count;
+				break;
+			default:
+				continue;
+			}
+			if (ranges == nullptr)
+				continue;
+
+			for (uint32_t e = 0; e < count; ++e)
+			{
+				const reshade::api::descriptor_range &r = ranges[e];
+				if (r.type != reshade::api::descriptor_type::constant_buffer)
+					continue;
+				if (r.dx_register_space != 0)
+					continue;
+				if (r.dx_register_index != register_index)
+					continue;
+				if ((static_cast<uint32_t>(r.visibility) &
+						static_cast<uint32_t>(reshade::api::shader_stage::vertex)) == 0)
+					continue;
+				out.param = i;
+				out.binding = r.binding;
+				return out;
+			}
+		}
+		return out; // not found
+	}
+
+	// Snapshots the game's skeleton CBVs (root params bound at the
+	// vs-cb3/vs-cb4 registers of this draw's layout) for the present-time
+	// capture, and arms the bridge's lazy CBV replacement when the merged
+	// skeleton is already live. No-op unless the rule declared a
+	// [SkeletonChain] component.
+	static void prepare_skeleton(reshade::api::command_list *cmd_list,
+		const TextureOverrideRule &rule, AddonBridge *bridge)
+	{
+		if (!g_state.skel.active())
+			return;
+
+		uint64_t layout = 0;
+		SkelParamRef cb3{}, cb4{};
+		RuntimeState::RootCbvBinding orig3{}, orig4{};
+		SkeletonChain::Component comp{};
+		uint64_t gpu_buf = 0;
+		RuntimeState::SkelRegions regions{};
+		{
+			std::lock_guard<std::mutex> guard(g_state.lock);
+
+			const auto cit = g_state.skel.rules.find(rule.section);
+			if (cit == g_state.skel.rules.end())
+				return;
+			comp = cit->second;
+
+			const auto it = g_state.cl_root.find(cmd_list->get_native());
+			if (it == g_state.cl_root.end())
+				return;
+			layout = it->second.layout;
+			if (layout == 0)
+				return;
+
+			// Identify the root params bound at vs-cb3/vs-cb4 (cached per
+			// layout; the negative result stays cached so an unmatched
+			// layout logs once instead of every draw).
+			auto idit = g_state.skel_layout_params.find(layout);
+			if (idit == g_state.skel_layout_params.end())
+			{
+				const auto lit = g_state.layouts.find(layout);
+				if (lit == g_state.layouts.end())
+					return; // layout destroyed before the draw: skip quietly
+				cb3 = find_push_cbv_param(lit->second, 3);
+				cb4 = find_push_cbv_param(lit->second, 4);
+				idit = g_state.skel_layout_params.emplace(layout,
+					std::make_pair(cb3, cb4)).first;
+				log::info("skeleton chain: layout %llx -> cb3=param%u.%u cb4=param%u.%u%s",
+					static_cast<unsigned long long>(layout),
+					cb3.param, cb3.binding, cb4.param, cb4.binding,
+					(!cb3.found() || !cb4.found())
+						? " (missing push CBV at register 3/4: skeleton CBs may live in descriptor tables)"
+						: "");
+			}
+			cb3 = idit->second.first;
+			cb4 = idit->second.second;
+			if (!cb3.found() || !cb4.found())
+				return;
+
+			const auto b3 = it->second.cbvs.find(
+				(static_cast<uint64_t>(cb3.param) << 32) | cb3.binding);
+			const auto b4 = it->second.cbvs.find(
+				(static_cast<uint64_t>(cb4.param) << 32) | cb4.binding);
+			if (b3 == it->second.cbvs.end() || b4 == it->second.cbvs.end())
+				return; // params exist but not bound yet on this list
+			orig3 = b3->second;
+			orig4 = b4->second;
+
+			// The latest component draw of the frame wins: passes record
+			// the same character with equal skeleton content.
+			g_state.skel_snap.layout = layout;
+			g_state.skel_snap.cb3_param = cb3.param;
+			g_state.skel_snap.cb3_binding = cb3.binding;
+			g_state.skel_snap.cb4_param = cb4.param;
+			g_state.skel_snap.cb4_binding = cb4.binding;
+			g_state.skel_snap.main_buf = orig4.buffer;
+			g_state.skel_snap.main_off = orig4.offset;
+			g_state.skel_snap.extra_buf = orig3.buffer;
+			g_state.skel_snap.extra_off = orig3.offset;
+			g_state.skel_snap.frame = g_state.frame;
+			g_state.skel_snap.valid = true;
+
+			gpu_buf = g_state.skel_gpu_ready ? g_state.skel_gpu_buf : 0;
+			regions = g_state.skel_regions;
+		}
+
+		if (bridge == nullptr || gpu_buf == 0)
+			return;
+
+		// Regions this component binds: the per-component remapped
+		// skeleton (comp3-6) or the full merged skeleton (comp0-2/7).
+		uint64_t main_off = regions.merged_off;
+		uint64_t main_size = SkeletonChain::bone_rows_bytes(SkeletonChain::k_merged_bones);
+		uint64_t extra_off = regions.extra_off;
+		uint64_t extra_size = main_size;
+		bool remapped = false;
+		if (comp.remap_id >= 0 && comp.remap_id < static_cast<int32_t>(SkeletonChain::k_remap_tables) &&
+			regions.remap_bytes[comp.remap_id] != 0)
+		{
+			main_off = regions.remap_off[comp.remap_id];
+			main_size = regions.remap_bytes[comp.remap_id];
+			extra_off = regions.extra_remap_off[comp.remap_id];
+			extra_size = regions.remap_bytes[comp.remap_id];
+			remapped = true;
+		}
+
+		// One-time per component: the exact CBV region the draws bind.
+		{
+			static std::unordered_set<std::string> s_logged;
+			if (s_logged.insert(rule.section).second)
+				log::info("skeleton arm '%s': layout %llx cb4=param%u.%u ->%s%llu +%llu, cb3=param%u.%u ->%s%llu +%llu (%u bone(s), remap_id=%d)",
+					rule.section.c_str(),
+					static_cast<unsigned long long>(layout),
+					cb4.param, cb4.binding,
+					remapped ? "remap" : "merged",
+					static_cast<unsigned long long>(main_off),
+					static_cast<unsigned long long>(main_size),
+					cb3.param, cb3.binding,
+					remapped ? "remap" : "merged",
+					static_cast<unsigned long long>(extra_off),
+					static_cast<unsigned long long>(extra_size),
+					comp.vg_count, comp.remap_id);
+		}
+
+		bridge->arm_skeleton(layout, cb3, orig3, cb4, orig4,
+			gpu_buf, main_off, main_size, extra_off, extra_size);
 	}
 
 	static bool evaluate_draw(reshade::api::command_list *cmd_list,
@@ -1253,6 +2282,207 @@ namespace wwmi
 		if (rule == nullptr)
 			return false;
 
+		// M7 diagnostics: the FIRST skip of a rule dumps the game's
+		// real IA layout next to the mod's assumed strides
+		// (vb0..vb4 = 12/8/16/4/16). A mismatch means the GPU fetches
+		// vertices with the wrong layout (deformation, spring wobble)
+		// and can read past the mod buffers' ends (DEVICE_HUNG). Also
+		// shows the game's own draw parameters (base vertex, instance
+		// count) the re-issued draws must be sane against.
+		if (first_skip && have_ia)
+		{
+			char slots[320];
+			size_t used = 0;
+			slots[0] = '\0';
+			for (uint32_t i = 0; i < IaState::max_vb_slots &&
+				used + 48 < sizeof(slots); ++i)
+				if (ia.vb_valid_mask & (1u << i))
+					used += static_cast<size_t>(sprintf_s(
+						slots + used, sizeof(slots) - used,
+						"[%u]=%llx+%llx/%u ", i,
+						static_cast<unsigned long long>(ia.vbs[i].buffer),
+						static_cast<unsigned long long>(ia.vbs[i].offset),
+						ia.vbs[i].stride));
+			log::info("first skip '%s': draw idx=(%u,%u) inst=%u base=%d ib=%llx+%llu is=%u vb slots (handle+offset/stride): %s",
+				rule->section.c_str(), call.first_index, call.index_count,
+				call.instance_count,
+				static_cast<int32_t>(call.first_vertex),
+				static_cast<unsigned long long>(ia.ib_buffer),
+				static_cast<unsigned long long>(ia.ib_offset),
+				ia.ib_index_size, slots);
+		}
+
+		// M8 diagnostics: dump the input layout semantics of the
+		// pipeline the game used for this draw. UE's DX12 runtime
+		// re-packs vertex streams, so this is the ground truth for
+		// which slot really carries BLENDINDICES/BLENDWEIGHT (the
+		// skin data whose absence causes the comps-3-6 deformation
+		// and spring wobble) and in which format.
+		if (first_skip)
+		{
+			uint64_t pipe = 0;
+			{
+				std::lock_guard<std::mutex> guard(g_state.lock);
+				const auto pit = g_state.cl_pipeline.find(cmd_list->get_native());
+				if (pit != g_state.cl_pipeline.end())
+					pipe = pit->second;
+			}
+			const std::vector<reshade::api::pipeline_subobject> *subs =
+				pipe != 0 ? g_state.pipelines.clone_source(pipe) : nullptr;
+			if (subs != nullptr)
+			{
+				for (const reshade::api::pipeline_subobject &sub : *subs)
+				{
+					if (sub.type != reshade::api::pipeline_subobject_type::input_layout ||
+						sub.data == nullptr || sub.count == 0)
+						continue;
+					const auto *els =
+						static_cast<const reshade::api::input_element *>(sub.data);
+					char elems[768];
+					size_t used = 0;
+					elems[0] = '\0';
+					for (uint32_t e = 0; e < sub.count && used + 80 < sizeof(elems); ++e)
+					{
+						const char *fname = vertex_format_name(els[e].format);
+						char fbuf[16];
+						if (fname == nullptr)
+						{
+							sprintf_s(fbuf, "f%u", static_cast<uint32_t>(els[e].format));
+							fname = fbuf;
+						}
+						used += static_cast<size_t>(sprintf_s(elems + used,
+							sizeof(elems) - used, "[%u]%s%u %s off=%u st=%u; ",
+							els[e].buffer_binding,
+							els[e].semantic != nullptr ? els[e].semantic : "?",
+							els[e].semantic_index, fname,
+							els[e].offset, els[e].stride));
+					}
+					log::info("pipe %llx input layout: %s",
+						static_cast<unsigned long long>(pipe), elems);
+				}
+			}
+			else
+			{
+				log::info("pipe %llx input layout: not cached (clone source evicted)",
+					static_cast<unsigned long long>(pipe));
+			}
+		}
+
+		// M8 diagnostics: same first skip also dumps the graphics root
+		// state -- layout parameter types and every bound root CBV with
+		// its buffer size. The skeleton CBs are the large (>= ~4KB)
+		// vertex-stage CBs; identifying them is step one of the bone
+		// capture/rebind system (fixes comps 3-6 deformation).
+		if (first_skip)
+		{
+			reshade::api::device *const dev = cmd_list->get_device();
+			RuntimeState::ClRootState root;
+			const std::vector<reshade::api::pipeline_layout_param> *params = nullptr;
+			{
+				std::lock_guard<std::mutex> guard(g_state.lock);
+				const auto it = g_state.cl_root.find(cmd_list->get_native());
+				if (it != g_state.cl_root.end())
+				{
+					root = it->second;
+					const auto lit = g_state.layouts.find(root.layout);
+					if (lit != g_state.layouts.end())
+						params = &lit->second;
+				}
+			}
+
+			if (params != nullptr)
+		{
+			// M9: dump each parameter with its descriptor class and, for
+			// push descriptors, register/space/visibility -- the mapping
+			// data the skeleton chain keys on (push CBV b3/b4 = the DX11
+			// mod's vs-cb3/vs-cb4).
+			char desc[1024];
+			size_t used = 0;
+			desc[0] = '\0';
+			for (size_t i = 0; i < params->size() && used + 72 < sizeof(desc); ++i)
+			{
+				const reshade::api::pipeline_layout_param &p = (*params)[i];
+				switch (p.type)
+				{
+				case reshade::api::pipeline_layout_param_type::descriptor_table:
+				case reshade::api::pipeline_layout_param_type::descriptor_table_with_flags:
+					used += static_cast<size_t>(sprintf_s(desc + used,
+						sizeof(desc) - used, "[%zu]table ", i));
+					break;
+				case reshade::api::pipeline_layout_param_type::push_constants:
+					used += static_cast<size_t>(sprintf_s(desc + used,
+						sizeof(desc) - used, "[%zu]const ", i));
+					break;
+				default:
+				{
+					const reshade::api::descriptor_range *r = nullptr;
+					const char *cls = "?";
+					if (p.type == reshade::api::pipeline_layout_param_type::push_descriptors)
+						r = &p.push_descriptors;
+					else if (p.type == reshade::api::pipeline_layout_param_type::push_descriptors_with_ranges ||
+						p.type == reshade::api::pipeline_layout_param_type::push_descriptors_with_ranges_and_flags)
+					{
+						if (p.descriptor_table_with_flags.count >= 1 &&
+							p.descriptor_table_with_flags.ranges != nullptr)
+							r = &p.descriptor_table_with_flags.ranges[0];
+					}
+					const char *rtype = "?";
+					if (r != nullptr)
+					{
+						if (r->type == reshade::api::descriptor_type::constant_buffer)
+							rtype = "b";
+						else if (r->type == reshade::api::descriptor_type::shader_resource_view)
+							rtype = "t";
+						else if (r->type == reshade::api::descriptor_type::unordered_access_view)
+							rtype = "u";
+						else
+							rtype = "s";
+						used += static_cast<size_t>(sprintf_s(desc + used,
+							sizeof(desc) - used, "[%zu]push %s%u/s%u/%s ", i, rtype,
+							r->dx_register_index, r->dx_register_space,
+							(static_cast<uint32_t>(r->visibility) &
+								static_cast<uint32_t>(reshade::api::shader_stage::vertex))
+								? "v" : "-"));
+						(void)cls;
+						continue;
+					}
+					used += static_cast<size_t>(sprintf_s(desc + used,
+						sizeof(desc) - used, "[%zu]push %s ", i, cls));
+					break;
+				}
+				}
+			}
+			log::info("root layout %llx: %s",
+				static_cast<unsigned long long>(root.layout), desc);
+		}
+			else
+			{
+				log::info("root layout: no push/table events recorded for this command list (bindings may live in descriptor heaps)");
+			}
+
+			for (const auto &kv : root.cbvs)
+			{
+				const uint32_t param = static_cast<uint32_t>(kv.first >> 32);
+				const uint32_t reg = static_cast<uint32_t>(kv.first & 0xffffffffu);
+				uint64_t size = 0;
+				if (dev != nullptr && kv.second.buffer != 0)
+				{
+					const reshade::api::resource_desc d =
+						dev->get_resource_desc({ kv.second.buffer });
+					if (d.type == reshade::api::resource_type::buffer)
+						size = d.buffer.size;
+				}
+				log::info("root cbv param=%u reg=%u: buffer %llx +%llu (%llu bytes)",
+					param, reg,
+					static_cast<unsigned long long>(kv.second.buffer),
+					static_cast<unsigned long long>(kv.second.offset),
+					static_cast<unsigned long long>(size));
+			}
+			for (const auto &kv : root.tables)
+				log::info("root table param=%u: base %llx", kv.first,
+					static_cast<unsigned long long>(kv.second));
+		}
+
 		// Script path: run the rule body; its 'handling = skip' execution
 		// is the actual skip decision. IA bindings the script captured are
 		// re-applied afterwards (see restore_ia).
@@ -1267,13 +2497,19 @@ namespace wwmi
 				const uint64_t before_lists = mrt->rt.lists_executed;
 
 				bool skip = false;
-				{
-					ScriptExecGuard exec_guard;
-					AddonBridge bridge(device, cmd_list);
-					skip = mrt->rt.run_override(rule->section, &bridge, have_ia ? &ia : nullptr);
-					if (have_ia)
-						restore_ia(cmd_list, ia);
-				}
+			{
+				ScriptExecGuard exec_guard;
+				AddonBridge bridge(device, cmd_list);
+				// M9: snapshot the skeleton CBVs and arm the lazy CBV
+				// replacement (applies at the first re-issued draw, is
+				// pushed back after the body -- both inside this guard so
+				// the pushes never pollute the root-state tracking).
+				prepare_skeleton(cmd_list, *rule, &bridge);
+				skip = mrt->rt.run_override(rule->section, &bridge, have_ia ? &ia : nullptr);
+				if (have_ia)
+					restore_ia(cmd_list, ia);
+				bridge.restore_skeleton();
+			}
 
 				g_state.script_lists_executed.fetch_add(
 					mrt->rt.lists_executed - before_lists);
@@ -1709,7 +2945,8 @@ static void on_destroy_device(reshade::api::device *device)
 		"unsupported=%llu evicted=%llu matches=%llu srv_views=%llu | "
 		"desc_updates=%llu desc_copies=%llu overwrites=%llu replacements=%llu | "
 		"M2 buffers: tracked=%llu binds=%llu hashed=%llu unsupported=%llu evicted=%llu skipped_draws=%llu | "
-		"M6 views: tracked=%llu verified=%llu failed=%llu evicted=%llu probes=%llu",
+		"M6 views: tracked=%llu verified=%llu failed=%llu evicted=%llu probes=%llu | "
+		"M9 skeleton: captures=%llu pushes=%llu",
 		static_cast<unsigned long long>(st.tracked),
 		static_cast<unsigned long long>(st.hashed),
 		static_cast<unsigned long long>(wwmi::g_state.initialdata_hashes.load()),
@@ -1732,7 +2969,9 @@ static void on_destroy_device(reshade::api::device *device)
 		static_cast<unsigned long long>(vs.verified),
 		static_cast<unsigned long long>(vs.failed),
 		static_cast<unsigned long long>(vs.evicted),
-		static_cast<unsigned long long>(wwmi::g_state.view_probes_issued.load()));
+		static_cast<unsigned long long>(wwmi::g_state.view_probes_issued.load()),
+		static_cast<unsigned long long>(wwmi::g_state.skel_captures),
+		static_cast<unsigned long long>(wwmi::g_state.skel_pushes));
 }
 
 static void on_init_resource(reshade::api::device *device, const reshade::api::resource_desc &desc,
@@ -1973,6 +3212,8 @@ static void on_destroy_command_list(reshade::api::command_list *cmd_list)
 	// M4: pipeline records die with the command list
 	wwmi::g_state.cl_pipeline.erase(cmd_list->get_native());
 	wwmi::g_state.cl_compute_pipeline.erase(cmd_list->get_native());
+	// M8: root state dies with the command list
+	wwmi::g_state.cl_root.erase(cmd_list->get_native());
 }
 
 // M2: IA index buffer binding. Replays into the command list's IaState
@@ -2047,6 +3288,169 @@ static void on_bind_vertex_buffers(reshade::api::command_list *cmd_list, uint32_
 		if (slot_buffers[i] != 0 && slot_widths[i] != 0)
 			wwmi::g_state.buffers.track(slot_buffers[i], slot_widths[i],
 				wwmi::BufferRole::vertex, wwmi::g_state.frame);
+}
+
+// ---- M8: root signature tracking ----
+
+// Pipeline layout (root signature) created: remember its parameters so
+// the component-draw diagnostics can name each root parameter (table vs
+// push descriptor, register index, shader visibility).
+static void on_init_pipeline_layout(reshade::api::device * /*device*/,
+	uint32_t param_count, const reshade::api::pipeline_layout_param *params,
+	reshade::api::pipeline_layout layout)
+{
+	// Layouts are bounded by the game's root signature count; recording
+	// is cheap enough to do unconditionally (before load_mods too).
+	//
+	// M9 fix: ReShade's params array -- and the descriptor-range arrays
+	// its table/range parameters point to -- is only valid DURING this
+	// callback. A shallow copy leaves every descriptor_table /
+	// push_descriptors_with_ranges entry with a dangling 'ranges'
+	// pointer, so reading register indices later returned heap garbage
+	// (the skeleton identification saw 'sampler / space 0xCC0B...').
+	// Deep-copy the range arrays here; on_destroy_pipeline_layout frees
+	// them again.
+	std::lock_guard<std::mutex> guard(wwmi::g_state.lock);
+	auto &stored = wwmi::g_state.layouts[layout.handle];
+	stored.assign(params, params + param_count);
+
+	for (reshade::api::pipeline_layout_param &p : stored)
+	{
+		using pt = reshade::api::pipeline_layout_param_type;
+		switch (p.type)
+		{
+		case pt::descriptor_table:
+		{
+			const uint32_t count = p.descriptor_table.count;
+			const reshade::api::descriptor_range *src = p.descriptor_table.ranges;
+			if (count == 0 || src == nullptr)
+				continue;
+			auto *copy = new reshade::api::descriptor_range[count];
+			for (uint32_t i = 0; i < count; ++i)
+				copy[i] = src[i]; // POD copy (static_samplers may alias the game's; unused)
+			p.descriptor_table.ranges = copy;
+			break;
+		}
+		case pt::descriptor_table_with_flags:
+		case pt::push_descriptors_with_ranges:
+		case pt::push_descriptors_with_ranges_and_flags:
+		{
+			const uint32_t count = p.descriptor_table_with_flags.count;
+			const reshade::api::descriptor_range_with_flags *src =
+				p.descriptor_table_with_flags.ranges;
+			if (count == 0 || src == nullptr)
+				continue;
+			auto *copy = new reshade::api::descriptor_range_with_flags[count];
+			for (uint32_t i = 0; i < count; ++i)
+				copy[i] = src[i];
+			p.descriptor_table_with_flags.ranges = copy;
+			break;
+		}
+		default:
+			break; // push_descriptors (inline range) / push_constants: value copy above is complete
+		}
+	}
+}
+
+static void on_destroy_pipeline_layout(reshade::api::device * /*device*/,
+	reshade::api::pipeline_layout layout)
+{
+	std::lock_guard<std::mutex> guard(wwmi::g_state.lock);
+	const auto it = wwmi::g_state.layouts.find(layout.handle);
+	if (it == wwmi::g_state.layouts.end())
+		return;
+
+	// Free the deep-copied range arrays (see on_init_pipeline_layout).
+	for (reshade::api::pipeline_layout_param &p : it->second)
+	{
+		using pt = reshade::api::pipeline_layout_param_type;
+		switch (p.type)
+		{
+		case pt::descriptor_table:
+			delete[] p.descriptor_table.ranges;
+			p.descriptor_table.ranges = nullptr;
+			break;
+		case pt::descriptor_table_with_flags:
+		case pt::push_descriptors_with_ranges:
+		case pt::push_descriptors_with_ranges_and_flags:
+			delete[] p.descriptor_table_with_flags.ranges;
+			p.descriptor_table_with_flags.ranges = nullptr;
+			break;
+		default:
+			break;
+		}
+	}
+	wwmi::g_state.layouts.erase(it);
+}
+
+// SetGraphicsRootConstantBufferView (and SRV/UAV): record every root CBV
+// binding. The event only fires for CBVs here -- descriptors are
+// buffer_range {buffer, offset, size}. Keyed (param<<32)|register so the
+// latest binding per slot wins, exactly like the command list does.
+static void on_push_descriptors(reshade::api::command_list *cmd_list,
+	reshade::api::shader_stage /*stages*/, reshade::api::pipeline_layout layout,
+	uint32_t layout_param, const reshade::api::descriptor_table_update &update)
+{
+	if (wwmi::t_script_exec)
+		return; // our own bridge bindings must not pollute game state
+	if (!wwmi::g_state.draw_intercept.load(std::memory_order_relaxed))
+		return;
+	if (update.type != reshade::api::descriptor_type::constant_buffer)
+		return;
+	if (update.count == 0 || update.descriptors == nullptr)
+		return;
+
+	const auto *ranges =
+		static_cast<const reshade::api::buffer_range *>(update.descriptors);
+
+	std::lock_guard<std::mutex> guard(wwmi::g_state.lock);
+	wwmi::RuntimeState::ClRootState &state =
+		wwmi::g_state.cl_root[cmd_list->get_native()];
+	// M9: a pipeline layout switch invalidates every root argument of the
+	// command list (D3D12 semantics: the app must rebind all params after
+	// changing the root signature). Stale entries from the previous layout
+	// would otherwise alias unrelated params -- the skeleton rebind would
+	// push garbage CBVs into the game's draws.
+	if (state.layout != layout.handle)
+	{
+		state.cbvs.clear();
+		state.tables.clear();
+		state.layout = layout.handle;
+	}
+	for (uint32_t i = 0; i < update.count; ++i)
+	{
+		if (ranges[i].buffer.handle == 0)
+			continue;
+		state.cbvs[(static_cast<uint64_t>(layout_param) << 32) |
+			(update.binding + i)] = { ranges[i].buffer.handle,
+				ranges[i].offset, ranges[i].size };
+	}
+}
+
+// SetGraphicsRootDescriptorTable: record table bases per parameter.
+static void on_bind_descriptor_tables(reshade::api::command_list *cmd_list,
+	reshade::api::shader_stage /*stages*/, reshade::api::pipeline_layout layout,
+	uint32_t first, uint32_t count, const reshade::api::descriptor_table *tables,
+	uint32_t /*dynamic_offset_count*/, const uint32_t * /*dynamic_offsets*/)
+{
+	if (wwmi::t_script_exec)
+		return;
+	if (!wwmi::g_state.draw_intercept.load(std::memory_order_relaxed))
+		return;
+	if (count == 0 || tables == nullptr)
+		return;
+
+	std::lock_guard<std::mutex> guard(wwmi::g_state.lock);
+	wwmi::RuntimeState::ClRootState &state =
+		wwmi::g_state.cl_root[cmd_list->get_native()];
+	if (state.layout != layout.handle)
+	{
+		state.cbvs.clear();
+		state.tables.clear();
+		state.layout = layout.handle;
+	}
+	for (uint32_t i = 0; i < count; ++i)
+		state.tables[first + i] = tables[i].handle;
 }
 
 // M2: non-indexed draw. 3DMigoto DrawCallInfo semantics: IndexCount /
@@ -2266,6 +3670,11 @@ static void on_present(reshade::api::command_queue *queue, reshade::api::swapcha
 	for (const wwmi::TrackedBuffer &snap : pending_buffers)
 		wwmi::hash_buffer_via_readback(queue, snap);
 
+	// M9: skeleton chain -- capture the game's skeleton CBs (snapshot from
+	// this frame's component draws), merge into the mod's skeleton layout
+	// and upload; the next frame's mod draws bind the result.
+	wwmi::process_skeleton(queue);
+
 	// M6: pooled-IB region probes. The region is copied out of the
 	// pool, hashed with the ordinary 3DMigoto buffer formula (desc
 	// ByteWidth = span) and compared against the mod's rule hash. A
@@ -2282,6 +3691,41 @@ static void on_present(reshade::api::command_queue *queue, reshade::api::swapcha
 		}
 		for (const wwmi::RuntimeState::IndexProbe &p : probes)
 			wwmi::verify_index_view_probe(queue, p);
+	}
+
+	// M6 diagnostics: periodically dump the draw-signature tallies of
+	// interesting views -- the REAL section layout the game renders
+	// with, independent of mod.ini's window guesses.
+	if (wwmi::g_state.frame % 600 == 0)
+	{
+		std::lock_guard<std::mutex> guard(wwmi::g_state.lock);
+		size_t dumped = 0;
+		for (const auto &kv : wwmi::g_state.index_views.views())
+		{
+			if (dumped >= wwmi::IndexViewTracker::k_diag_views)
+				break;
+			const wwmi::TrackedIndexView &v = kv.second;
+			if (!v.interesting || v.sigs.empty())
+				continue;
+			++dumped;
+
+			std::string line;
+			char one[48];
+			for (const auto &s : v.sigs)
+			{
+				sprintf_s(one, "(%u,%u)x%u ", s.first, s.count, s.hits);
+				if (line.size() + strlen(one) > 900)
+				{
+					line += "...";
+					break;
+				}
+				line += one;
+			}
+			wwmi::log::info("view draws: buffer %p off=%llu is=%u: %s",
+				reinterpret_cast<void *>(v.handle),
+				static_cast<unsigned long long>(v.offset),
+				v.index_size, line.c_str());
+		}
 	}
 
 	// M4: retire blend-clone PSOs whose source pipeline was destroyed.
@@ -2423,6 +3867,60 @@ static void draw_overlay(reshade::api::effect_runtime *runtime)
 		static_cast<unsigned long long>(collisions),
 		static_cast<unsigned long long>(session_pairs));
 
+	// ---- Mod manager: per-mod enable toggle, persisted for the next
+	// launch (no hot reload: rules, runtimes and resources are wired
+	// through immutable indexes after load_mods()).
+	ImGui::SeparatorText("Mod manager");
+	ImGui::TextDisabled("toggles are saved immediately and take effect on the next launch");
+
+	{
+		std::vector<RuntimeState::ModCatalogEntry> catalog;
+		{
+			std::lock_guard<std::mutex> guard(g_state.lock);
+			catalog = g_state.mod_catalog;
+		}
+
+		if (catalog.empty())
+		{
+			ImGui::TextDisabled("no mods found under the mods root");
+		}
+		else if (ImGui::BeginTable("modmanager", 2, ImGuiTableFlags_Borders))
+		{
+			ImGui::TableSetupColumn("mod");
+			ImGui::TableSetupColumn("this session");
+			ImGui::TableHeadersRow();
+
+			for (const RuntimeState::ModCatalogEntry &entry : catalog)
+			{
+				ImGui::TableNextRow();
+				ImGui::TableNextColumn();
+
+				bool enabled = entry.enabled;
+				if (ImGui::Checkbox(entry.name.c_str(), &enabled))
+				{
+					std::lock_guard<std::mutex> guard(g_state.lock);
+					for (RuntimeState::ModCatalogEntry &live : g_state.mod_catalog)
+						if (live.name == entry.name)
+							live.enabled = enabled;
+					write_disabled_mods(g_state.mod_catalog);
+					wwmi::log::info("mod manager: '%s' %s (applies on next launch)",
+						entry.name.c_str(), enabled ? "enabled" : "disabled");
+				}
+
+				ImGui::TableNextColumn();
+				if (!entry.enabled)
+					ImGui::TextUnformatted(entry.loaded
+						? "loaded (skipped after restart)"
+						: "skipped");
+				else
+					ImGui::TextUnformatted(entry.loaded
+						? "loaded"
+						: "mod.ini failed to load");
+			}
+			ImGui::EndTable();
+		}
+	}
+
 	if (!log_snapshot.empty())
 	{
 		ImGui::SeparatorText("Recent activations");
@@ -2550,6 +4048,12 @@ BOOL WINAPI DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 		reshade::register_event<reshade::addon_event::destroy_pipeline>(&on_destroy_pipeline);
 		reshade::register_event<reshade::addon_event::bind_pipeline>(&on_bind_pipeline);
 
+		// M8: root signature tracking (skeleton system)
+		reshade::register_event<reshade::addon_event::init_pipeline_layout>(&on_init_pipeline_layout);
+		reshade::register_event<reshade::addon_event::destroy_pipeline_layout>(&on_destroy_pipeline_layout);
+		reshade::register_event<reshade::addon_event::push_descriptors>(&on_push_descriptors);
+		reshade::register_event<reshade::addon_event::bind_descriptor_tables>(&on_bind_descriptor_tables);
+
 		reshade::register_overlay("WWMI-DX12", &draw_overlay);
 		break;
 
@@ -2580,6 +4084,12 @@ BOOL WINAPI DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 			reshade::unregister_event<reshade::addon_event::init_pipeline>(&on_init_pipeline);
 			reshade::unregister_event<reshade::addon_event::destroy_pipeline>(&on_destroy_pipeline);
 			reshade::unregister_event<reshade::addon_event::bind_pipeline>(&on_bind_pipeline);
+
+			// M8: root signature tracking (skeleton system)
+			reshade::unregister_event<reshade::addon_event::init_pipeline_layout>(&on_init_pipeline_layout);
+			reshade::unregister_event<reshade::addon_event::destroy_pipeline_layout>(&on_destroy_pipeline_layout);
+			reshade::unregister_event<reshade::addon_event::push_descriptors>(&on_push_descriptors);
+			reshade::unregister_event<reshade::addon_event::bind_descriptor_tables>(&on_bind_descriptor_tables);
 
 			reshade::unregister_overlay("WWMI-DX12", &draw_overlay);
 

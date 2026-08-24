@@ -267,7 +267,58 @@ namespace wwmi
 		uint64_t frame_seen = 0;       // LRU tick
 		uint64_t probe_frame = 0;      // last probe issue (cooldown)
 		uint32_t retries = 0;
+
+		// M6 diagnostics: once a view's draw hits ANY window rule it
+		// becomes 'interesting' and every subsequent indexed-draw
+		// signature (first_index, index_count) is tallied here. The
+		// tally reveals the view's REAL section layout -- whether the
+		// game still draws the mod's 8 tiled windows or a different
+		// split -- which byte hashes cannot (UE DX12 re-indexes mesh
+		// data, so the DX11-era hash never reproduces).
+		struct Sig { uint32_t first; uint32_t count; uint32_t hits; };
+		static constexpr size_t k_max_sigs = 48;
+		std::vector<Sig> sigs;
+		bool interesting = false;
+
+		void tally(uint32_t first_index, uint32_t index_count)
+		{
+			for (Sig &s : sigs)
+				if (s.first == first_index && s.count == index_count)
+				{
+					++s.hits;
+					return;
+				}
+			if (sigs.size() < k_max_sigs)
+				sigs.push_back({ first_index, index_count, 1 });
+		}
 	};
+
+	// M7: signature-coverage verification for pooled views. True when
+	// every window of the group has been drawn at least once on the
+	// view (see TrackedIndexView::sigs): the view's real draw layout
+	// matches the mod's tiling exactly, which verifies the view WITHOUT
+	// the byte-hash probe. UE DX12 re-indexes mesh vertices, so the
+	// DX11-era content hash never reproduces -- but the section layout
+	// does, and a full multi-window layout match is collision-proof
+	// (mesh mods tile 8+ windows; the odds of another mesh drawing the
+	// same (first_index, index_count) sequence are negligible).
+	inline bool signature_coverage_complete(const TrackedIndexView &v,
+		const DrawRuleGroup &g)
+	{
+		for (const DrawWindow &w : g.windows)
+		{
+			bool found = false;
+			for (const TrackedIndexView::Sig &s : v.sigs)
+				if (s.first == w.first_index && s.count == w.index_count)
+				{
+					found = true;
+					break;
+				}
+			if (!found)
+				return false;
+		}
+		return true;
+	}
 
 	class IndexViewTracker
 	{
@@ -295,6 +346,12 @@ namespace wwmi
 		bool probe_due(const TrackedIndexView &v, uint64_t frame) const;
 
 		size_t size() const { return _views.size(); }
+
+		// Diagnostics: iterate live views (unordered) for the periodic
+		// draw-signature dump. Cap the log to the first N entries.
+		static constexpr size_t k_diag_views = 8;
+		const std::unordered_map<uint64_t, TrackedIndexView> &
+			views() const { return _views; }
 
 		struct Stats
 		{

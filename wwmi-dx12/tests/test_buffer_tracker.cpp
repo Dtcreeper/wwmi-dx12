@@ -1,7 +1,10 @@
 #include "buffer_tracker.hpp"
 #include "buffer_hash.hpp"
+#include "mod_rules.hpp"
 #include "test_framework.hpp"
 
+#include <filesystem>
+#include <fstream>
 #include <vector>
 
 using namespace wwmi;
@@ -420,4 +423,134 @@ WWMI_TEST(index_view_probe_state_machine_and_routing)
 	EXPECT(v2 != nullptr && v2->state == TrackedIndexView::State::failed);
 	EXPECT(!views.probe_due(*v2, 10)); // cooldown active
 	EXPECT(views.probe_due(*v2, 10 + IndexViewTracker::retry_cooldown_frames));
+}
+
+// Regression for the load_mods assembly bug: rules parsed from a real
+// mod.ini (Lynae-style windowed components) must produce a non-empty
+// DrawWindowIndex when fed through the same build() call the addon's
+// load path makes. The original defect -- windows.build() never called
+// in load_mods -- left find_by_draw permanently dead while every unit
+// test passed (tests built the object directly). This test covers the
+// parser -> window-index data flow end to end so a parse regression
+// dropping the window matchers fails here, and the missing-build-call
+// class of bug is additionally guarded by the addon's startup warn
+// (windowed rules present but no probe group).
+WWMI_TEST(windowed_rules_from_mod_ini_feed_draw_window_index)
+{
+	const std::filesystem::path dir =
+		std::filesystem::temp_directory_path() / "wwmi_test_windowed";
+	std::filesystem::create_directories(dir);
+	const std::filesystem::path ini = dir / "mod.ini";
+
+	{
+		std::ofstream f(ini, std::ios::binary);
+		f << "[TextureOverrideComponent0]\n"
+			<< "hash = 0c33d628\n"
+			<< "handling = skip\n"
+			<< "match_first_index = 0\n"
+			<< "match_index_count = 17970\n"
+			<< "\n"
+			<< "[TextureOverrideComponent1]\n"
+			<< "hash = 0c33d628\n"
+			<< "handling = skip\n"
+			<< "match_first_index = 17970\n"
+			<< "match_index_count = 45636\n";
+	}
+
+	ModRules mod;
+	EXPECT(load_mod_rules(ini, mod));
+	EXPECT_EQ(mod.overrides.size(), static_cast<size_t>(2));
+
+	// Same assembly the addon performs in load_mods(): windows BEFORE
+	// index.build() consumes (moves) the rules.
+	DrawWindowIndex windows;
+	windows.build(mod.overrides);
+	EXPECT(!windows.empty());
+	EXPECT_EQ(windows.groups().size(), static_cast<size_t>(1));
+
+	const DrawRuleGroup &g = windows.groups()[0];
+	EXPECT_EQ(g.hash, 0x0c33d628u);
+	EXPECT_EQ(g.windows.size(), static_cast<size_t>(2));
+	EXPECT_EQ(g.min_first_index, 0u);
+	EXPECT_EQ(g.max_end_index, 17970u + 45636u);
+	EXPECT(windows.find_by_draw(0, 17970) == &g);
+	EXPECT(windows.find_by_draw(17970, 45636) == &g);
+
+	std::filesystem::remove_all(dir);
+}
+
+// M7: signature-coverage verification -- the pooled-view substitute
+// for the byte-hash probe, which cannot succeed on UE DX12 (vertex
+// re-indexing changes the bytes while the section layout survives).
+WWMI_TEST(signature_coverage_verifies_pooled_view)
+{
+	IndexViewTracker views;
+	DrawRuleGroup grp;
+	grp.hash = 0x0c33d628u;
+	grp.section = "TextureOverrideComponent0";
+	// Lynae body tiling: 8 windows covering [0, 310422).
+	const uint32_t firsts[8] = { 0, 17970, 63606, 75930,
+		173856, 274170, 301470, 308814 };
+	const uint32_t counts[8] = { 17970, 45636, 12324, 97926,
+		100314, 27300, 7344, 1608 };
+	for (int i = 0; i < 8; ++i)
+		grp.windows.push_back({ firsts[i], counts[i] });
+
+	TrackedIndexView *v = views.track(0x1234, 0x2000, 4, 1);
+	EXPECT(v != nullptr);
+	v->interesting = true;
+
+	// Draw 7 of the 8 windows: coverage incomplete.
+	for (int i = 0; i < 7; ++i)
+		v->tally(firsts[i], counts[i]);
+	EXPECT(!signature_coverage_complete(*v, grp));
+
+	// Interleave a foreign signature (another mesh's draw): it must
+	// not affect coverage of the group's windows.
+	v->tally(999999, 42);
+	EXPECT(!signature_coverage_complete(*v, grp));
+
+	// The last window draws: coverage complete -> the addon would now
+	// call set_verified with the group hash.
+	v->tally(firsts[7], counts[7]);
+	EXPECT(signature_coverage_complete(*v, grp));
+
+	views.set_verified(0x1234, 0x2000, grp.hash);
+	const TrackedIndexView *done = views.find(0x1234, 0x2000);
+	EXPECT(done != nullptr);
+	EXPECT(done->state == TrackedIndexView::State::verified);
+	EXPECT_EQ(done->hash, grp.hash);
+
+	// Verified views route via the whole-buffer rule path: a matching
+	// draw signature must resolve to a windowed rule.
+	HashIndex index;
+	std::vector<TextureOverrideRule> rules;
+	for (int i = 0; i < 8; ++i)
+	{
+		TextureOverrideRule r;
+		r.section = "Component" + std::to_string(i);
+		r.hash = grp.hash;
+		r.has_hash = true;
+		r.match_first_index.enabled = true;
+		r.match_first_index.value = firsts[i];
+		r.match_index_count.enabled = true;
+		r.match_index_count.value = counts[i];
+		r.handling = HandlingMode::skip;
+		rules.push_back(r);
+	}
+	index.build(std::move(rules));
+
+	IaState ia{};
+	ia.ib_buffer = 0x1234;
+	ia.ib_offset = 0x2000;
+	ia.ib_index_size = 4;
+	DrawCallInfo call{};
+	call.first_index = firsts[3];
+	call.index_count = counts[3];
+
+	const TextureOverrideRule *hit = find_skip_rule(
+		index, BufferTracker{}, &views, ia, call, true);
+	EXPECT(hit != nullptr);
+	EXPECT_EQ(hit->match_first_index.value, firsts[3]);
+	EXPECT_EQ(hit->match_index_count.value, counts[3]);
 }
